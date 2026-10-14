@@ -13,7 +13,7 @@
 ## Установка и запуск
 
 ```bash
-pip install numpy scipy pandas openpyxl pyerfa matplotlib
+pip install -r requirements.txt
 
 python sat_coords.py --opm R3D21_2026-10-08T12.57.00.027+03.00.opm \
                      --excel all_sats.xlsx --step 60 --out R3D21_xyz.csv

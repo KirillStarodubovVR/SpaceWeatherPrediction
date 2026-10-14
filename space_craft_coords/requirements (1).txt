@@ -1,0 +1,7 @@
+# Установка: pip install -r requirements.txt   (Python 3.9+)
+numpy>=1.21
+scipy>=1.7          # solve_ivp, DOP853
+pandas>=2.0         # разбор дат format="ISO8601"
+openpyxl>=3.0       # чтение .xlsx через pandas
+pyerfa>=2.0         # системы координат и время (модуль erfa)
+matplotlib>=3.5     # plot_orbit.py: 3D-вид Земли и трасса
