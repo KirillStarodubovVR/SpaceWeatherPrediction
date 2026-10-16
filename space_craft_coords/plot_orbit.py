@@ -99,9 +99,43 @@ def _cols(frame, kind="r"):
 
 
 def geodetic(r_itrf_km):
-    """ITRF (км) -> долгота, широта (град), высота (км) над эллипсоидом WGS-84."""
+    """ITRF (км) -> долгота, ГЕОДЕЗИЧЕСКАЯ широта (град), высота (км) над эллипсоидом WGS-84.
+    Это высота по нормали к поверхности эллипсоида, она НЕ равна ha/hp из таблицы."""
     lon, lat, h = erfa.gc2gd(1, np.asarray(r_itrf_km, dtype=float) * 1e3)
     return np.degrees(lon), np.degrees(lat), np.asarray(h) / 1e3
+
+
+def position_info(df, i0):
+    """Параметры положения КА в строке i0. Высоты считаются тремя способами:
+
+    h_sphere -- |r| - 6378.137 км: мгновенное расстояние от центра Земли минус
+                экваториальный радиус. В той же шкале, что ha/hp в таблице.
+    h_mean   -- a_ср - 6378.137 км: средняя большая полуось (оскулирующая a,
+                усреднённая за виток вокруг момента) минус R. Это (ha+hp)/2 таблицы.
+    h_geod   -- геодезическая высота над эллипсоидом WGS-84 (как в GPS/картах).
+                У полюсов поверхность ближе к центру на ~21 км, поэтому h_geod больше.
+    """
+    r_i = df[_cols("itrf")].to_numpy()[i0]
+    rn = float(np.linalg.norm(r_i))
+    lon, lat_gd, h_gd = geodetic(r_i)
+
+    t = df["t_s"].to_numpy()
+    R = df[_cols("gcrf")].to_numpy()
+    V = df[_cols("gcrf", "v")].to_numpy()
+    T = 2 * math.pi * math.sqrt(rn**3 / MU)
+    # окно в один виток вокруг момента; у краёв данных сдвигается внутрь
+    lo = min(max(t[i0] - T / 2, t.min()), t.max() - T)
+    m = (t >= lo) & (t < lo + T)
+    h_mean = None
+    if m.sum() >= 20 and (t[m].max() - t[m].min()) > 0.9 * T:     # нужен почти полный виток
+        rr = np.linalg.norm(R[m], axis=1)
+        a = 1.0 / (2.0 / rr - np.sum(V[m] ** 2, axis=1) / MU)
+        h_mean = float(a.mean() - A_WGS84)
+    return {
+        "lon": float(lon), "lat_geod": float(lat_gd),
+        "lat_geoc": math.degrees(math.asin(r_i[2] / rn)),
+        "r": rn, "h_sphere": rn - A_WGS84, "h_mean": h_mean, "h_geod": float(h_gd),
+    }
 
 
 def itrf_to_gcrf_matrix(time_utc, dut1=0.0):
@@ -123,6 +157,20 @@ def _ll_to_xyz(lon_deg, lat_deg, h=0.0):
     return np.stack([(A_WGS84 + h) * np.cos(lat) * np.cos(lon),
                      (A_WGS84 + h) * np.cos(lat) * np.sin(lon),
                      (B_WGS84 + h) * np.sin(lat)], axis=-1)
+
+
+def format_info(p, frame, r_xyz):
+    """Текст подписи: все величины с явным определением."""
+    hm = f"{p['h_mean']:8.2f} км" if p["h_mean"] is not None else "   нет полного витка"
+    return (f"координаты {frame.upper()}, км:\n"
+            f"  x={r_xyz[0]:.1f}  y={r_xyz[1]:.1f}  z={r_xyz[2]:.1f}\n"
+            f"|r|                        {p['r']:8.2f} км\n"
+            f"высота над R=6378.137:\n"
+            f"  мгновенная |r|−R        {p['h_sphere']:8.2f} км\n"
+            f"  средняя a_ср−R (таблица) {hm}\n"
+            f"высота над эллипс. WGS-84  {p['h_geod']:8.2f} км\n"
+            f"широта геодез. / геоцентр. {p['lat_geod']:+.3f}° / {p['lat_geoc']:+.3f}°\n"
+            f"долгота (ITRF)             {p['lon']:+.3f}°")
 
 
 # --------------------------------------------------------------------------- 3D
@@ -161,7 +209,8 @@ def plot_satellite(csv_path, time=None, frame="itrf", past_rev=1.0, future_rev=0
     T = 2 * math.pi * math.sqrt(np.linalg.norm(r_sat) ** 3 / MU)
     when = df["time_utc"].iloc[i0]
 
-    lon_s, lat_s, h_s = geodetic(df[_cols("itrf")].to_numpy()[i0])
+    pinfo = position_info(df, i0)
+    lon_s, lat_s = pinfo["lon"], pinfo["lat_geod"]
 
     # камера: по умолчанию прямо на КА, чуть сверху
     if azim is None:
@@ -231,10 +280,7 @@ def plot_satellite(csv_path, time=None, frame="itrf", past_rev=1.0, future_rev=0
 
     head = title or "Положение КА"
     fig.suptitle(f"{head}\n{when}", color=TEXT, fontsize=12, y=0.98)
-    info = (f"система: {frame.upper()}\n"
-            f"r = ({r_sat[0]:.1f}, {r_sat[1]:.1f}, {r_sat[2]:.1f}) км\n"
-            f"широта {lat_s:+.3f}°, долгота {lon_s:+.3f}°\n"
-            f"высота {h_s:.2f} км")
+    info = format_info(pinfo, frame, r_sat)
     ax.text2D(0.02, 0.02, info, transform=ax.transAxes, color=TEXT_2, fontsize=9,
               family="monospace", va="bottom")
     leg = ax.legend(loc="upper right", frameon=False, fontsize=9)
@@ -253,7 +299,8 @@ def plot_ground_track(csv_path, time=None, past_rev=3.0, future_rev=1.0, coastli
     df = csv_path if isinstance(csv_path, pd.DataFrame) else pd.read_csv(csv_path)
     i0 = _pick_index(df, time)
     t = df["t_s"].to_numpy()
-    lon, lat, h = geodetic(df[_cols("itrf")].to_numpy())
+    lon, lat, _ = geodetic(df[_cols("itrf")].to_numpy())
+    pinfo = position_info(df, i0)
     T = 2 * math.pi * math.sqrt(np.linalg.norm(df[_cols("itrf")].to_numpy()[i0]) ** 3 / MU)
 
     if ax is None:
@@ -286,7 +333,9 @@ def plot_ground_track(csv_path, time=None, past_rev=3.0, future_rev=1.0, coastli
         s.set_color(GRID)
     ax.set_xlabel("долгота, °", color=TEXT_2); ax.set_ylabel("широта, °", color=TEXT_2)
     ax.set_title(f"{title or 'Трасса КА'} — {df['time_utc'].iloc[i0]}\n"
-                 f"широта {lat[i0]:+.3f}°, долгота {lon[i0]:+.3f}°, высота {h[i0]:.2f} км",
+                 f"геод. широта {lat[i0]:+.3f}°, долгота {lon[i0]:+.3f}°, "
+                 f"|r|−R = {pinfo['h_sphere']:.2f} км"
+                 + (f", a_ср−R = {pinfo['h_mean']:.2f} км" if pinfo["h_mean"] is not None else ""),
                  color=TEXT, fontsize=11)
     leg = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=False, fontsize=9)
     for txt in leg.get_texts():
